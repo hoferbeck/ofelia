@@ -20,7 +20,7 @@ func NewSlogLogger(w io.Writer) Logger {
 }
 
 func (l *SlogLogger) Criticalf(format string, args ...interface{}) {
-	l.logger.Error(fmt.Sprintf(format, args...))
+	l.logger.Error(fmt.Sprintf(format, args...), slog.String("severity", "critical"))
 }
 
 func (l *SlogLogger) Debugf(format string, args ...interface{}) {
@@ -32,7 +32,7 @@ func (l *SlogLogger) Errorf(format string, args ...interface{}) {
 }
 
 func (l *SlogLogger) Noticef(format string, args ...interface{}) {
-	l.logger.Info(fmt.Sprintf(format, args...))
+	l.logger.Info(fmt.Sprintf(format, args...), slog.String("severity", "notice"))
 }
 
 func (l *SlogLogger) Warningf(format string, args ...interface{}) {
