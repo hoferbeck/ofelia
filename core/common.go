@@ -358,5 +358,5 @@ func loadDockerAuthConfigs() map[string]registry.AuthConfig {
 		}
 	}
 
-	return nil
+	return map[string]registry.AuthConfig{}
 }

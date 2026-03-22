@@ -264,10 +264,6 @@ func (j *RunJob) watchContainer() error {
 		}
 	}
 
-	if s == nil {
-		return ErrUnexpected
-	}
-
 	switch s.ExitCode {
 	case 0:
 		return nil
