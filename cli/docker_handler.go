@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"strings"
 	"time"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/mcuadros/ofelia/core"
 )
@@ -29,7 +32,7 @@ var (
 )
 
 type DockerHandler struct {
-	dockerClient      *docker.Client
+	dockerClient      *client.Client
 	notifier          labelConfigUpdater
 	configsFromLabels bool
 	logger            core.Logger
@@ -40,13 +43,12 @@ type labelConfigUpdater interface {
 	dockerLabelsUpdate(map[string]map[string]string)
 }
 
-// TODO: Implement an interface so the code does not have to use third parties directly
-func (c *DockerHandler) GetInternalDockerClient() *docker.Client {
+func (c *DockerHandler) GetInternalDockerClient() *client.Client {
 	return c.dockerClient
 }
 
-func (c *DockerHandler) buildDockerClient() (*docker.Client, error) {
-	d, err := docker.NewClientFromEnv()
+func (c *DockerHandler) buildDockerClient() (*client.Client, error) {
+	d, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +73,7 @@ func NewDockerHandler(config *Config, dockerFilters []string, configsFromLabels 
 		return nil, err
 	}
 	// Do a sanity check on docker
-	_, err = c.dockerClient.Info()
+	_, err = c.dockerClient.Info(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +122,7 @@ func (c *DockerHandler) WaitForLabels() {
 	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		_, err := c.dockerClient.InspectContainerWithOptions(docker.InspectContainerOptions{ID: id})
+		_, err := c.dockerClient.ContainerInspect(context.Background(), id)
 		if err == nil {
 			c.logger.Debugf("Found ofelia container with ID: %s", id)
 			return
@@ -131,7 +133,7 @@ func (c *DockerHandler) WaitForLabels() {
 }
 
 func (c *DockerHandler) GetDockerLabels() (map[string]map[string]string, error) {
-	var filters = map[string][]string{
+	var parsedFilters = map[string][]string{
 		"label": {requiredLabelFilter},
 	}
 	for _, f := range c.filters {
@@ -139,19 +141,35 @@ func (c *DockerHandler) GetDockerLabels() (map[string]map[string]string, error) 
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", err, f)
 		}
-		filters[key] = append(filters[key], value)
+		parsedFilters[key] = append(parsedFilters[key], value)
 	}
 
-	conts, err := c.dockerClient.ListContainers(docker.ListContainersOptions{Filters: filters})
+	dockerFilters := filters.NewArgs()
+	for key, values := range parsedFilters {
+		for _, value := range values {
+			dockerFilters.Add(key, value)
+		}
+	}
+
+	conts, err := c.dockerClient.ContainerList(context.Background(), container.ListOptions{Filters: dockerFilters})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errFailedToListContainers, err)
-	} else if len(conts) == 0 {
-		return nil, fmt.Errorf("%w: %v", errNoContainersMatchingFilters, filters)
+	}
+
+	filtered := make([]container.Summary, 0, len(conts))
+	for _, cont := range conts {
+		if matchesContainerFilters(cont, parsedFilters) {
+			filtered = append(filtered, cont)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("%w: %v", errNoContainersMatchingFilters, parsedFilters)
 	}
 
 	var labels = make(map[string]map[string]string)
 
-	for _, cont := range conts {
+	for _, cont := range filtered {
 		if len(cont.Names) > 0 && len(cont.Labels) > 0 {
 			name := strings.TrimPrefix(cont.Names[0], "/")
 			for k := range cont.Labels {
@@ -167,6 +185,33 @@ func (c *DockerHandler) GetDockerLabels() (map[string]map[string]string, error) 
 	}
 
 	return labels, nil
+}
+
+func matchesContainerFilters(cont container.Summary, parsedFilters map[string][]string) bool {
+	for key, values := range parsedFilters {
+		for _, value := range values {
+			switch key {
+			case "label":
+				parts := strings.SplitN(value, "=", 2)
+				if len(parts) != 2 || cont.Labels[parts[0]] != parts[1] {
+					return false
+				}
+			case "name":
+				matched := false
+				for _, name := range cont.Names {
+					if strings.Contains(strings.TrimPrefix(name, "/"), value) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
 }
 
 func parseFilter(filter string) (key, value string, err error) {

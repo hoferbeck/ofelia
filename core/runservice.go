@@ -1,21 +1,26 @@
 package core
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 )
 
 // Note: The ServiceJob is loosely inspired by https://github.com/alexellis/jaas/
 
 type RunServiceJob struct {
 	BareJob `mapstructure:",squash"`
-	Client  *docker.Client `json:"-"`
+	Client  *client.Client `json:"-"`
 	User    string         `default:"root"`
 	TTY     bool           `default:"false"`
 	// do not use bool values with "default:true" because if
@@ -27,7 +32,7 @@ type RunServiceJob struct {
 	Network string
 }
 
-func NewRunServiceJob(c *docker.Client) *RunServiceJob {
+func NewRunServiceJob(c *client.Client) *RunServiceJob {
 	return &RunServiceJob{Client: c}
 }
 
@@ -36,44 +41,56 @@ func (j *RunServiceJob) Run(ctx *Context) error {
 		return err
 	}
 
-	svc, err := j.buildService()
+	svcID, err := j.buildService()
 
 	if err != nil {
 		return err
 	}
 
-	ctx.Logger.Noticef("Created service %s for job %s\n", svc.ID, j.Name)
+	ctx.Logger.Noticef("Created service %s for job %s\n", svcID, j.Name)
 
-	if err := j.watchContainer(ctx, svc.ID); err != nil {
+	if err := j.watchContainer(ctx, svcID); err != nil {
+		if isNotFoundError(err) {
+			return nil
+		}
 		return err
 	}
 
-	return j.deleteService(ctx, svc.ID)
+	return j.deleteService(ctx, svcID)
 }
 
 func (j *RunServiceJob) pullImage() error {
-	o, a := buildPullOptions(j.Image)
-	if err := j.Client.PullImage(o, a); err != nil {
+	ref, opts := buildPullOptions(j.Image)
+	stream, err := j.Client.ImagePull(context.Background(), ref, opts)
+	if err != nil {
+		if isNotFoundError(err) {
+			images, listErr := j.Client.ImageList(context.Background(), buildFindLocalImageOptions(j.Image))
+			if listErr == nil && len(images) == 1 {
+				return nil
+			}
+		}
 		return fmt.Errorf("error pulling image %q: %s", j.Image, err)
 	}
+	defer stream.Close()
+	_, _ = io.Copy(io.Discard, stream)
 
 	return nil
 }
 
-func (j *RunServiceJob) buildService() (*swarm.Service, error) {
+func (j *RunServiceJob) buildService() (string, error) {
 
 	//createOptions := types.ServiceCreateOptions{}
 
 	max := uint64(1)
-	createSvcOpts := docker.CreateServiceOptions{}
+	var spec swarm.ServiceSpec
 
-	createSvcOpts.ServiceSpec.TaskTemplate.ContainerSpec =
+	spec.TaskTemplate.ContainerSpec =
 		&swarm.ContainerSpec{
 			Image: j.Image,
 		}
 
 	// Make the service run once and not restart
-	createSvcOpts.ServiceSpec.TaskTemplate.RestartPolicy =
+	spec.TaskTemplate.RestartPolicy =
 		&swarm.RestartPolicy{
 			MaxAttempts: &max,
 			Condition:   swarm.RestartPolicyConditionNone,
@@ -82,7 +99,7 @@ func (j *RunServiceJob) buildService() (*swarm.Service, error) {
 	// For a service to interact with other services in a stack,
 	// we need to attach it to the same network
 	if j.Network != "" {
-		createSvcOpts.Networks = []swarm.NetworkAttachmentConfig{
+		spec.Networks = []swarm.NetworkAttachmentConfig{
 			swarm.NetworkAttachmentConfig{
 				Target: j.Network,
 			},
@@ -90,22 +107,21 @@ func (j *RunServiceJob) buildService() (*swarm.Service, error) {
 	}
 
 	if j.Command != "" {
-		createSvcOpts.ServiceSpec.TaskTemplate.ContainerSpec.Command = strings.Split(j.Command, " ")
+		spec.TaskTemplate.ContainerSpec.Command = strings.Split(j.Command, " ")
 	}
 
-	svc, err := j.Client.CreateService(createSvcOpts)
+	resp, err := j.Client.ServiceCreate(context.Background(), spec, swarm.ServiceCreateOptions{})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	return svc, err
+	return resp.ID, nil
 }
 
 const (
 
 	// TODO are these const defined somewhere in the docker API?
-	swarmError   = -999
-	timeoutError = -998
+	swarmError = -999
 )
 
 var svcChecker = time.NewTicker(watchDuration)
@@ -115,25 +131,22 @@ func (j *RunServiceJob) watchContainer(ctx *Context, svcID string) error {
 
 	ctx.Logger.Noticef("Checking for service ID %s (%s) termination\n", svcID, j.Name)
 
-	svc, err := j.Client.InspectService(svcID)
-	if err != nil {
-		return fmt.Errorf("Failed to inspect service %s: %s", svcID, err.Error())
-	}
-
 	// On every tick, check if all the services have completed, or have error out
 	var wg sync.WaitGroup
 	wg.Add(1)
+	var err error
+	started := time.Now()
 
 	go func() {
 		defer wg.Done()
-		for _ = range svcChecker.C {
+		for range svcChecker.C {
 
-			if svc.CreatedAt.After(time.Now().Add(maxProcessDuration)) {
+			if time.Since(started) > maxProcessDuration {
 				err = ErrMaxTimeRunning
 				return
 			}
 
-			taskExitCode, found := j.findtaskstatus(ctx, svc.ID)
+			taskExitCode, found := j.findtaskstatus(ctx, svcID)
 
 			if found {
 				exitCode = taskExitCode
@@ -149,11 +162,8 @@ func (j *RunServiceJob) watchContainer(ctx *Context, svcID string) error {
 }
 
 func (j *RunServiceJob) findtaskstatus(ctx *Context, taskID string) (int, bool) {
-	taskFilters := make(map[string][]string)
-	taskFilters["service"] = []string{taskID}
-
-	tasks, err := j.Client.ListTasks(docker.ListTasksOptions{
-		Filters: taskFilters,
+	tasks, err := j.Client.TaskList(context.Background(), swarm.TaskListOptions{
+		Filters: filters.NewArgs(filters.Arg("service", taskID)),
 	})
 
 	if err != nil {
@@ -203,11 +213,9 @@ func (j *RunServiceJob) deleteService(ctx *Context, svcID string) error {
 		return nil
 	}
 
-	err := j.Client.RemoveService(docker.RemoveServiceOptions{
-		ID: svcID,
-	})
+	err := j.Client.ServiceRemove(context.Background(), svcID)
 
-	if _, is := err.(*docker.NoSuchService); is {
+	if isNotFoundError(err) {
 		ctx.Logger.Warningf("Service %s cannot be removed. An error may have happened, "+
 			"or it might have been removed by another process", svcID)
 		return nil
@@ -215,4 +223,17 @@ func (j *RunServiceJob) deleteService(ctx *Context, svcID string) error {
 
 	return err
 
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errdefs.IsNotFound(err) || cerrdefs.IsNotFound(err) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "404") || strings.Contains(msg, "not found")
 }

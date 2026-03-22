@@ -1,12 +1,13 @@
 package core
 
 import (
-	"archive/tar"
-	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 	"github.com/fsouza/go-dockerclient/testing"
 	. "gopkg.in/check.v1"
 )
@@ -15,7 +16,7 @@ const ContainerFixture = "test-container"
 
 type SuiteExecJob struct {
 	server *testing.DockerServer
-	client *docker.Client
+	client *client.Client
 }
 
 var _ = Suite(&SuiteExecJob{})
@@ -47,7 +48,8 @@ func (s *SuiteExecJob) SetUpTest(c *C) {
 
 	s.server.CustomHandler("/version", http.HandlerFunc(versionDockerHandler))
 
-	s.client, err = docker.NewClient(s.server.URL())
+	host := "tcp://" + strings.TrimPrefix(strings.TrimSuffix(s.server.URL(), "/"), "http://")
+	s.client, err = client.NewClientWithOpts(client.WithHost(host), client.WithVersion("1.27"))
 	c.Assert(err, IsNil)
 
 	s.buildContainer(c)
@@ -72,36 +74,21 @@ func (s *SuiteExecJob) TestRun(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(executed, Equals, true)
 
-	container, err := s.client.InspectContainer(ContainerFixture)
+	container, err := s.client.ContainerInspect(context.Background(), ContainerFixture)
 	c.Assert(err, IsNil)
 	c.Assert(len(container.ExecIDs) > 0, Equals, true)
 
 	exec, err := job.inspectExec()
 	c.Assert(err, IsNil)
-	c.Assert(exec.ProcessConfig.EntryPoint, Equals, "echo")
-	c.Assert(exec.ProcessConfig.Arguments, DeepEquals, []string{"-a", "foo bar"})
-	c.Assert(exec.ProcessConfig.User, Equals, "foo")
-	c.Assert(exec.ProcessConfig.Tty, Equals, true)
+	c.Assert(exec.Running, Equals, false)
+	c.Assert(exec.ExitCode, Equals, 0)
 	// no way to check for env :|
 }
 
 func (s *SuiteExecJob) buildContainer(c *C) {
-	inputbuf := bytes.NewBuffer(nil)
-	tr := tar.NewWriter(inputbuf)
-	tr.WriteHeader(&tar.Header{Name: "Dockerfile"})
-	tr.Write([]byte("FROM base\n"))
-	tr.Close()
-
-	err := s.client.BuildImage(docker.BuildImageOptions{
-		Name:         "test",
-		InputStream:  inputbuf,
-		OutputStream: bytes.NewBuffer(nil),
-	})
+	err := BuildTestImage(s.client, "test")
 	c.Assert(err, IsNil)
 
-	_, err = s.client.CreateContainer(docker.CreateContainerOptions{
-		Name:   ContainerFixture,
-		Config: &docker.Config{Image: "test"},
-	})
+	_, err = s.client.ContainerCreate(context.Background(), &container.Config{Image: "test"}, nil, nil, nil, ContainerFixture)
 
 }

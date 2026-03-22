@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 	"github.com/fsouza/go-dockerclient/testing"
 	"github.com/mcuadros/ofelia/core"
 	check "gopkg.in/check.v1"
@@ -18,7 +20,7 @@ const imageFixture = "ofelia/test-image"
 
 type TestDockerSuit struct {
 	server *testing.DockerServer
-	client *docker.Client
+	client *client.Client
 }
 
 func buildFromDockerLabels(dockerFilters ...string) (*Config, error) {
@@ -46,13 +48,14 @@ func (s *TestDockerSuit) SetUpTest(c *check.C) {
 	s.server, err = testing.NewServer("127.0.0.1:0", nil, nil)
 	c.Assert(err, check.IsNil)
 
-	s.client, err = docker.NewClient(s.server.URL())
+	host := "tcp://" + strings.TrimPrefix(strings.TrimSuffix(s.server.URL(), "/"), "http://")
+	s.client, err = client.NewClientWithOpts(client.WithHost(host), client.WithVersion("1.27"))
 	c.Assert(err, check.IsNil)
 
 	err = core.BuildTestImage(s.client, imageFixture)
 	c.Assert(err, check.IsNil)
 
-	os.Setenv("DOCKER_HOST", s.server.URL())
+	os.Setenv("DOCKER_HOST", host)
 }
 
 func (s *TestDockerSuit) TearDownTest(c *check.C) {
@@ -131,24 +134,27 @@ func (s *TestDockerSuit) TestFilterErrorsLabel(c *check.C) {
 	}
 }
 
-func (s *TestDockerSuit) startTestContainersWithLabels(containerLabels []map[string]string) ([]*docker.Container, error) {
-	containers := []*docker.Container{}
+func (s *TestDockerSuit) startTestContainersWithLabels(containerLabels []map[string]string) ([]string, error) {
+	containers := []string{}
 
 	for i := range containerLabels {
-		cont, err := s.client.CreateContainer(docker.CreateContainerOptions{
-			Name: fmt.Sprintf("ofelia-test%d", i),
-			Config: &docker.Config{
+		cont, err := s.client.ContainerCreate(context.Background(),
+			&container.Config{
 				Cmd:    []string{"sleep", "500"},
 				Labels: containerLabels[i],
 				Image:  imageFixture,
 			},
-		})
+			nil,
+			nil,
+			nil,
+			fmt.Sprintf("ofelia-test%d", i),
+		)
 		if err != nil {
 			return containers, err
 		}
 
-		containers = append(containers, cont)
-		if err := s.client.StartContainer(cont.ID, nil); err != nil {
+		containers = append(containers, cont.ID)
+		if err := s.client.ContainerStart(context.Background(), cont.ID, container.StartOptions{}); err != nil {
 			return containers, err
 		}
 	}

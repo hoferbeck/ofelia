@@ -3,22 +3,28 @@ package core
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"io"
 	"os"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/client"
 )
 
-func BuildTestImage(client *docker.Client, name string) error {
+func BuildTestImage(client *client.Client, name string) error {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	tw.WriteHeader(&tar.Header{Name: "Dockerfile"})
 	tw.Write([]byte("FROM alpine\n"))
 	tw.Close()
 
-	return client.BuildImage(docker.BuildImageOptions{
-		Name:         name,
-		Remote:       "github.com/mcuadros/ofelia",
-		InputStream:  &buf,
-		OutputStream: os.Stdout,
+	resp, err := client.ImageBuild(context.Background(), &buf, build.ImageBuildOptions{
+		Tags: []string{name},
 	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(os.Stdout, resp.Body)
+	return nil
 }

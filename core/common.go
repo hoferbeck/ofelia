@@ -2,14 +2,19 @@ package core
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
 	"github.com/armon/circbuf"
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
 )
 
 var (
@@ -241,28 +246,27 @@ func randomID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func buildFindLocalImageOptions(image string) docker.ListImagesOptions {
-	return docker.ListImagesOptions{
-		Filters: map[string][]string{
-			"reference": []string{image},
-		},
+func buildFindLocalImageOptions(imageRef string) image.ListOptions {
+	return image.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("reference", imageRef)),
 	}
 }
 
-func buildPullOptions(image string) (docker.PullImageOptions, docker.AuthConfiguration) {
-	repository, tag := docker.ParseRepositoryTag(image)
+func buildPullOptions(imageRef string) (string, image.PullOptions) {
+	repository, tag := parseRepositoryTag(imageRef)
 
-	registry := parseRegistry(repository)
+	registryAddress := parseRegistry(repository)
 
 	if tag == "" {
 		tag = "latest"
 	}
 
-	return docker.PullImageOptions{
-		Repository: repository,
-		Registry:   registry,
-		Tag:        tag,
-	}, buildAuthConfiguration(registry)
+	opts := image.PullOptions{}
+	if auth, err := registry.EncodeAuthConfig(buildAuthConfiguration(registryAddress)); err == nil {
+		opts.RegistryAuth = auth
+	}
+
+	return fmt.Sprintf("%s:%s", repository, tag), opts
 }
 
 func parseRegistry(repository string) string {
@@ -278,26 +282,81 @@ func parseRegistry(repository string) string {
 	return ""
 }
 
-func buildAuthConfiguration(registry string) docker.AuthConfiguration {
-	var auth docker.AuthConfiguration
-	if dockercfg == nil {
-		return auth
+func buildAuthConfiguration(registryAddress string) registry.AuthConfig {
+	if len(dockerAuthConfigs) == 0 {
+		return registry.AuthConfig{}
 	}
 
-	if v, ok := dockercfg.Configs[registry]; ok {
+	if v, ok := dockerAuthConfigs[registryAddress]; ok {
 		return v
 	}
 
 	// try to fetch configs from docker hub default registry urls
 	// see example here: https://www.projectatomic.io/blog/2016/03/docker-credentials-store/
-	if registry == "" {
-		if v, ok := dockercfg.Configs["https://index.docker.io/v2/"]; ok {
+	if registryAddress == "" {
+		if v, ok := dockerAuthConfigs["https://index.docker.io/v2/"]; ok {
 			return v
 		}
-		if v, ok := dockercfg.Configs["https://index.docker.io/v1/"]; ok {
+		if v, ok := dockerAuthConfigs["https://index.docker.io/v1/"]; ok {
+			return v
+		}
+		if v, ok := dockerAuthConfigs["index.docker.io"]; ok {
+			return v
+		}
+		if v, ok := dockerAuthConfigs["docker.io"]; ok {
 			return v
 		}
 	}
 
-	return auth
+	return registry.AuthConfig{}
+}
+
+var dockerAuthConfigs map[string]registry.AuthConfig
+
+func init() {
+	dockerAuthConfigs = loadDockerAuthConfigs()
+}
+
+func parseRepositoryTag(imageRef string) (string, string) {
+	lastSlash := strings.LastIndex(imageRef, "/")
+	lastColon := strings.LastIndex(imageRef, ":")
+	if lastColon > lastSlash {
+		return imageRef[:lastColon], imageRef[lastColon+1:]
+	}
+
+	return imageRef, ""
+}
+
+func loadDockerAuthConfigs() map[string]registry.AuthConfig {
+	type dockerConfigFile struct {
+		Auths map[string]registry.AuthConfig `json:"auths"`
+	}
+
+	paths := make([]string, 0, 2)
+	if dockerConfig := os.Getenv("DOCKER_CONFIG"); dockerConfig != "" {
+		paths = append(paths, filepath.Join(dockerConfig, "config.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths, filepath.Join(home, ".docker", "config.json"))
+		paths = append(paths, filepath.Join(home, ".dockercfg"))
+	}
+
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		var cfg dockerConfigFile
+		if err := json.Unmarshal(raw, &cfg); err == nil && len(cfg.Auths) > 0 {
+			return cfg.Auths
+		}
+
+		var legacy map[string]registry.AuthConfig
+		if err := json.Unmarshal(raw, &legacy); err == nil && len(legacy) > 0 {
+			return legacy
+		}
+	}
+
+	return nil
 }
