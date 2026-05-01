@@ -126,6 +126,7 @@ func (c *Config) JobsCount() int {
 }
 
 func (c *Config) buildSchedulerMiddlewares(sh *core.Scheduler) {
+	sh.Use(middlewares.NewPrometheusMetrics())
 	sh.Use(middlewares.NewSlack(&c.Global.SlackConfig))
 	sh.Use(middlewares.NewSave(&c.Global.SaveConfig))
 	sh.Use(middlewares.NewMail(&c.Global.MailConfig))

@@ -11,13 +11,17 @@ import (
 
 // DaemonCommand daemon process
 type DaemonCommand struct {
-	ConfigFile        string   `long:"config" description:"configuration file" default:"/etc/ofelia.conf"`
-	DockerLabelConfig bool     `short:"d" long:"docker" description:"continiously poll docker labels for configurations"`
-	DockerFilters     []string `short:"f" long:"docker-filter" description:"filter to select docker containers. https://docs.docker.com/reference/cli/docker/container/ls/#filter"`
-	scheduler         *core.Scheduler
-	signals           chan os.Signal
-	done              chan bool
-	Logger            core.Logger
+	ConfigFile            string   `long:"config" description:"configuration file" default:"/etc/ofelia.conf"`
+	DockerLabelConfig     bool     `short:"d" long:"docker" description:"continiously poll docker labels for configurations"`
+	DockerFilters         []string `short:"f" long:"docker-filter" description:"filter to select docker containers. https://docs.docker.com/reference/cli/docker/container/ls/#filter"`
+	MetricsBindAddress    string   `long:"metrics-bind-address" description:"metrics server bind address" default:"0.0.0.0"`
+	MetricsBindPort       int      `long:"metrics-bind-port" description:"metrics server bind port" default:"8080"`
+	DisableMetricsServer  bool     `long:"disable-metrics-server" description:"disable Prometheus metrics server"`
+	scheduler             *core.Scheduler
+	metricsServer         *MetricsServer
+	signals               chan os.Signal
+	done                  chan bool
+	Logger                core.Logger
 }
 
 // Execute runs the daemon
@@ -75,6 +79,13 @@ func (c *DaemonCommand) boot() (err error) {
 }
 
 func (c *DaemonCommand) start() error {
+	if !c.DisableMetricsServer {
+		c.metricsServer = NewMetricsServer(c.MetricsBindAddress, c.MetricsBindPort, c.Logger)
+		if err := c.metricsServer.Start(); err != nil {
+			return fmt.Errorf("failed to start metrics server: %w", err)
+		}
+	}
+
 	c.setSignals()
 	if err := c.scheduler.Start(); err != nil {
 		return err
@@ -99,6 +110,13 @@ func (c *DaemonCommand) setSignals() {
 
 func (c *DaemonCommand) shutdown() error {
 	<-c.done
+
+	if c.metricsServer != nil {
+		if err := c.metricsServer.Stop(); err != nil {
+			c.Logger.Error("Error stopping metrics server", "error", err)
+		}
+	}
+
 	if !c.scheduler.IsRunning() {
 		return nil
 	}
